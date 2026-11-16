@@ -22,12 +22,17 @@ class Settings:
         return self.data_dir / "versions"
 
     @property
+    def packages_dir(self) -> Path:
+        return self.data_dir / "packages"
+
+    @property
     def tmp_dir(self) -> Path:
         return self.data_dir / "tmp"
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.versions_dir.mkdir(parents=True, exist_ok=True)
+        self.packages_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
 

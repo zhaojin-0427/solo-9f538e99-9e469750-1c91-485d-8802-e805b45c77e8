@@ -1,4 +1,4 @@
-"""FastAPI application: submit two daily rainfall blocks, browse, download."""
+"""FastAPI application: submit two daily rainfall blocks, browse, download, freeze packages."""
 
 from __future__ import annotations
 
@@ -14,9 +14,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, store
+from . import __version__, packages, store
 from .config import Settings, load_settings
 from .limits import BodyLimitMiddleware
 from .rasters import RasterInputError, load_block, validate_pair
@@ -105,6 +106,31 @@ def error_response(status: int, code: str, message: str, **extra: Any) -> JSONRe
     detail: dict[str, Any] = {"code": code, "message": message}
     detail.update(extra)
     return JSONResponse(status_code=status, content={"detail": detail})
+
+
+class PackageRequest(BaseModel):
+    start_day: str
+    end_day: str
+
+
+def validate_day_range(start_day: str, end_day: str) -> tuple[str, str]:
+    start = parse_day(start_day)
+    end = parse_day(end_day)
+    span = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+    if span < 1 or span > packages.MAX_PACKAGE_DAYS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_range",
+                "message": (
+                    "start_day must be on or before end_day and the range must cover "
+                    f"1 to {packages.MAX_PACKAGE_DAYS} days; got {span} days"
+                ),
+                "start_day": start,
+                "end_day": end,
+            },
+        )
+    return start, end
 
 
 def _validate_version_number(value: int) -> int:
@@ -489,6 +515,200 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 },
             )
         return _file_response(record)
+
+    @app.post(
+        "/api/v1/packages",
+        status_code=201,
+        tags=["packages"],
+        summary="Freeze the latest published version of each day into one ZIP package",
+        description=(
+            "Selects, at one consistent point in time, the newest published mosaic version "
+            f"for every UTC day in `[start_day, end_day]` (1 to {packages.MAX_PACKAGE_DAYS} "
+            "days), verifies each source GeoTIFF against its registered SHA-256 and packs "
+            "the original files plus a `manifest.json` (day, version, SHA-256 per member) "
+            "into one ZIP.\n\n"
+            "The whole package fails when a day has no published version (422 "
+            "`missing_days`) or a source file is missing/corrupted (500). Publishing keeps "
+            "working while the package is built; if a newer version for a selected day is "
+            "published before the package is registered, the build is aborted with 409 "
+            "`package_conflict` and no downloadable half-package remains. A package becomes "
+            "downloadable by number only after both the archive and its registration "
+            "succeeded. Versions published after registration leave the package downloadable "
+            "but mark it `stale` in query responses."
+        ),
+        responses={
+            201: {"description": "Package registered and downloadable"},
+            409: {"description": "A newer version appeared while packaging"},
+            422: {"description": "Invalid range or days without a published version"},
+            500: {"description": "Source file missing/corrupt or build failed"},
+            503: {"description": "Another writer held the store too long"},
+        },
+    )
+    async def create_package(request: Request, body: PackageRequest) -> JSONResponse:
+        current_settings = get_settings(request)
+        start_day, end_day = validate_day_range(body.start_day, body.end_day)
+
+        def work() -> dict[str, Any]:
+            return packages.create_package(current_settings, start_day=start_day, end_day=end_day)
+
+        try:
+            payload = await run_in_threadpool(work)
+        except packages.PackageMissingDays as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "missing_days",
+                    "message": (
+                        "no published version exists for these days in the range: "
+                        + ", ".join(exc.days)
+                    ),
+                    "days": exc.days,
+                },
+            ) from exc
+        except packages.PackageConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "package_conflict",
+                    "message": (
+                        "a newer version was published for a selected day while the "
+                        "package was being built; no package was registered, retry to "
+                        "freeze the newer versions"
+                    ),
+                    "conflicts": exc.conflicts,
+                },
+            ) from exc
+        except packages.PackageSourceMissing as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "package_source_missing",
+                    "message": str(exc),
+                    "day": exc.day,
+                    "version": exc.version,
+                },
+            ) from exc
+        except packages.PackageSourceMismatch as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "package_source_mismatch",
+                    "message": str(exc),
+                    "day": exc.day,
+                    "version": exc.version,
+                    "expected_sha256": exc.expected,
+                    "actual_sha256": exc.actual,
+                },
+            ) from exc
+        except packages.PackageBusy as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "package_busy",
+                    "message": "another writer is still in progress; retry shortly",
+                },
+            ) from exc
+        except packages.PackageError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "package_failed",
+                    "message": "package could not be generated or registered",
+                },
+            ) from exc
+        return JSONResponse(payload, status_code=201)
+
+    @app.get(
+        "/api/v1/packages",
+        tags=["packages"],
+        summary="List frozen packages, newest first (stale flags included)",
+    )
+    def list_packages(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=200)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> dict:
+        items, total = packages.list_packages(get_settings(request), limit=limit, offset=offset)
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    @app.get(
+        "/api/v1/packages/{package_id}",
+        tags=["packages"],
+        summary="Show one package, its manifest and staleness",
+        responses={404: {"description": "Unknown package"}},
+    )
+    def get_package(
+        request: Request,
+        package_id: Annotated[int, PathParam(ge=1, description="Package number")],
+    ) -> dict:
+        payload = packages.get_package(get_settings(request), package_id)
+        if payload is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "package_not_found",
+                    "message": f"package {package_id} does not exist",
+                },
+            )
+        return {"package": payload}
+
+    @app.api_route(
+        "/api/v1/packages/{package_id}/download",
+        methods=["GET", "HEAD"],
+        include_in_schema=False,
+        response_class=FileResponse,
+        responses={
+            404: {"description": "Unknown package"},
+            410: {"description": "Archive file missing"},
+        },
+    )
+    @app.get(
+        "/api/v1/packages/{package_id}/download",
+        tags=["packages"],
+        summary="Download the frozen ZIP for a package",
+        response_class=FileResponse,
+        responses={
+            404: {"description": "Unknown package"},
+            410: {"description": "Archive file missing"},
+        },
+    )
+    def download_package(
+        request: Request,
+        package_id: Annotated[int, PathParam(ge=1, description="Package number")],
+    ) -> FileResponse:
+        record = packages.get_package_download(get_settings(request), package_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "package_not_found",
+                    "message": f"package {package_id} does not exist",
+                },
+            )
+        if not record.path.is_file():
+            log.error("archive for package %s is missing at %s", record.package_id, record.path)
+            raise HTTPException(
+                status_code=410,
+                detail={
+                    "code": "package_file_missing",
+                    "message": f"archive for package {record.package_id} is unavailable on disk",
+                },
+            )
+        return FileResponse(
+            path=record.path,
+            media_type="application/zip",
+            filename=record.filename,
+            headers={
+                "ETag": f'"{record.sha256}"',
+                "X-Package-Id": str(record.package_id),
+                "X-Package-SHA256": record.sha256,
+                "X-Package-Stale": "true" if record.stale else "false",
+                # The bytes are immutable, but the staleness header is
+                # computed live, so caches must revalidate (ETag makes that
+                # cheap) instead of serving a stale flag.
+                "Cache-Control": "no-cache",
+            },
+        )
 
     return app
 

@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS packages (
+    package_id     INTEGER PRIMARY KEY,
+    start_day      TEXT    NOT NULL,
+    end_day        TEXT    NOT NULL,
+    status         TEXT    NOT NULL CHECK (status IN ('ready')),
+    created_at     TEXT    NOT NULL,
+    sha256         TEXT    NOT NULL,
+    size_bytes     INTEGER NOT NULL,
+    manifest       TEXT    NOT NULL
+);
 """
 
 CURRENT_STATE_KEY = "current_version"
@@ -149,6 +160,9 @@ def _reconcile_files(settings: Settings) -> None:
     conn = connect(settings)
     try:
         registered = {int(row["version"]) for row in conn.execute("SELECT version FROM versions")}
+        registered_packages = {
+            int(row["package_id"]) for row in conn.execute("SELECT package_id FROM packages")
+        }
     finally:
         conn.close()
 
@@ -163,6 +177,18 @@ def _reconcile_files(settings: Settings) -> None:
                 log.warning("removed orphaned mosaic file %s", path)
             except OSError:
                 log.warning("could not remove orphaned mosaic %s", path, exc_info=True)
+
+    for path in settings.packages_dir.glob("p*.zip"):
+        try:
+            package_id = int(path.stem[1:])
+        except ValueError:
+            continue
+        if package_id not in registered_packages and now - path.stat().st_mtime > ORPHAN_GRACE_SECONDS:
+            try:
+                path.unlink()
+                log.warning("removed orphaned package archive %s", path)
+            except OSError:
+                log.warning("could not remove orphaned package %s", path, exc_info=True)
 
 
 def _read_pointer(conn: sqlite3.Connection) -> int:
@@ -348,13 +374,13 @@ def publish(
         # mode keep seeing and downloading the old current version.
         info = rasters.write_mosaic(left, right, temp_path)
         rasters.verify_mosaic(temp_path, info)
-        _fsync_file(temp_path)
+        fsync_file(temp_path)
         sha256 = rasters.sha256_file(temp_path)
         size_bytes = temp_path.stat().st_size
 
         final_path = settings.versions_dir / f"v{new_version}.tif"
         os.replace(temp_path, final_path)
-        _fsync_dir(settings.versions_dir)
+        fsync_dir(settings.versions_dir)
 
         published_at = iso_utc(datetime.now(timezone.utc))
         block_meta = [left.metadata(), right.metadata()]
@@ -432,7 +458,7 @@ def _rollback(conn: sqlite3.Connection) -> None:
             log.warning("rollback failed", exc_info=True)
 
 
-def _fsync_file(path: Path) -> None:
+def fsync_file(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -440,7 +466,7 @@ def _fsync_file(path: Path) -> None:
         os.close(fd)
 
 
-def _fsync_dir(path: Path) -> None:
+def fsync_dir(path: Path) -> None:
     try:
         fd = os.open(path, os.O_RDONLY)
     except OSError:

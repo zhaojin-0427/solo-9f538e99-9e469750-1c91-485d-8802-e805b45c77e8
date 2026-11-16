@@ -28,6 +28,10 @@ them). Change the host port with `RAINMOSAIC_PUBLISHED_PORT=9000 docker compose 
 | GET | `/api/v1/mosaics/{version}` | Metadata for a fixed version |
 | GET | `/api/v1/mosaics/{version}/download` | GeoTIFF for a fixed version |
 | GET | `/api/v1/download/current` | GeoTIFF for the current version |
+| POST | `/api/v1/packages` | Freeze the latest version of each day in a range into one ZIP |
+| GET | `/api/v1/packages` | List packages, newest first, with stale flags |
+| GET | `/api/v1/packages/{package_id}` | Package metadata, manifest and staleness |
+| GET | `/api/v1/packages/{package_id}/download` | Frozen ZIP for a package |
 | GET | `/healthz` | Liveness, database and current-version check |
 
 `/docs` supports submitting (multipart form), browsing and downloading.
@@ -94,6 +98,38 @@ Every version keeps its own immutable file, so `GET /api/v1/mosaics/{version}/do
 always returns exactly the bytes registered under that version (with a stable
 SHA-256 `ETag`), including after restarts.
 
+### Frozen input packages
+
+`POST /api/v1/packages` with JSON `{"start_day": "YYYY-MM-DD", "end_day": "YYYY-MM-DD"}`
+(1–7 UTC days) freezes one model-run input set:
+
+* at one consistent snapshot, the newest published version of every day in the
+  range is selected; a day without any published version fails the whole
+  request with `422 missing_days`;
+* each selected source GeoTIFF must exist and hash to the SHA-256 registered
+  for its version, otherwise the whole package fails (`500
+  package_source_missing` / `package_source_mismatch`);
+* the original GeoTIFFs plus a `manifest.json` (day, version, SHA-256, file
+  name and size per member) are packed into one ZIP;
+* publishing keeps working while the archive is built. If a newer version for
+  a selected day is published before the package is registered, the build is
+  aborted with `409 package_conflict` and no downloadable half-package is left
+  behind — retry to freeze the newer versions;
+* the package becomes downloadable by number only after both the archive file
+  and its database registration succeeded. Packages are immutable and survive
+  restarts;
+* versions published *after* registration leave the package downloadable, but
+  `GET /api/v1/packages` and `GET /api/v1/packages/{id}` mark it `stale` and
+  list the superseded days (`superseded`), and downloads carry an
+  `X-Package-Stale` header.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/packages \
+  -H 'Content-Type: application/json' \
+  -d '{"start_day": "2026-01-01", "end_day": "2026-01-07"}'
+curl -OJ http://localhost:8000/api/v1/packages/1/download
+```
+
 ### Errors
 
 Errors use `{"detail": {...}}` with `code` and `message`; raster errors also
@@ -103,10 +139,10 @@ carry `slot` (`a`/`b`) and, where applicable, `field` (`crs`, `resolution`,
 ## Design notes
 
 * SQLite runs in WAL mode with `synchronous=FULL`; state lives in
-  `$RAINMOSAIC_DATA_DIR/rainmosaic.sqlite3`, images in `versions/`, scratch files
-  in `tmp/`.
+  `$RAINMOSAIC_DATA_DIR/rainmosaic.sqlite3`, images in `versions/`, frozen
+  packages in `packages/`, scratch files in `tmp/`.
 * Startup validates the schema, repairs a dangling current pointer and removes
-  old orphan files left by interrupted publications.
+  old orphan files left by interrupted publications or package builds.
 * Generation and file I/O run in a worker thread so other requests, including
   downloads, keep flowing.
 * Only one API worker is used by default: SQLite plus a local disk volume make
@@ -123,7 +159,10 @@ python -m pytest -q
 The test suite covers the mosaic rules (overlap priority, NoData fallback, tie
 break, gaps, alignment/CRS/size validation), publishing, version pinning,
 conflicts, concurrent submissions, failed generation, downloads during
-publication, restart persistence, listing/pagination and error handling.
+publication, restart persistence, listing/pagination and error handling, plus
+the package lifecycle: latest-version freezing, range/missing-day validation,
+mid-build publish conflicts, staleness marking, source integrity failures and
+restart durability.
 
 ## Configuration
 
